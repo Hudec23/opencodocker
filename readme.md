@@ -1,53 +1,129 @@
-Sidecar
+# opencode-docker
 
-Add the Docker CLI to the image with this Dockerfile:
+Containerized agentic coder using [opencode](https://github.com/anomalyco/opencode) with Docker-in-Docker (DinD). The agent receives a project directory, follows instructions in the repo, writes code from scratch, and can spin up Docker services to validate its work. Git push access is scoped to a single repo via a fine-grained token.
 
-dockerfile
+## How it works
 
-FROM ghcr.io/anomalyco/opencode:2.2.0
-USER root
-RUN apk add --no-cache docker-cli docker-cli-buildx
-bash
+```
+┌─────────────────────────┐     tcp://oc-dind:2375
+│  opencode-docker (agent) │──────────────────────►┌──────────────┐
+│  --read-only             │                        │  oc-dind     │
+│  --cap-drop ALL          │                        │  (privileged)│
+│  /workspace (project)    │                        │  /workspace  │
+└─────────────────────────┘                        └──────────────┘
+         oc-net (private bridge)
+```
+
+The agent container is hardened (read-only FS, dropped caps, no new privileges). The DinD sidecar sits on the same private network — the agent talks to it via `DOCKER_HOST`. Both containers share the same `/workspace` mount so bind mounts inside agent-spawned containers resolve correctly.
+
+## Prerequisites
+
+- Docker (Desktop on Mac, Engine on Linux)
+- Anthropic API key
+- GitHub fine-grained PAT (for git push — see below)
+
+## Quick start
+
+```bash
+# 1. Clone this repo
+git clone https://github.com/Hudec23/opencode-docker
+cd opencode-docker
+
+# 2. Build the image
 docker build -t opencode-docker .
 
-Start a private daemon:
+# 3. Run against your project
+export ANTHROPIC_API_KEY=sk-ant-...
+export GH_TOKEN=github_pat_...
 
-bash
-docker network create oc-net
-docker run -d --name oc-dind --privileged --network oc-net \
-  -e DOCKER_TLS_CERTDIR="" \
-  -v "$PWD/project:/workspace" \
-  docker:dind
+./run.sh --project /path/to/your/project
+```
 
-Run OpenCode against it. This is the same command as before, with three changes: the network, DOCKER_HOST, and the new image.
+## Usage
 
-bash
-docker run --rm -it \
-  --network oc-net \
-  -e DOCKER_HOST=tcp://oc-dind:2375 \
-  --read-only --tmpfs /tmp:rw,exec,size=1g \
-  --user "$(id -u):$(id -g)" -e HOME=/tmp/home \
-  --cap-drop ALL --security-opt no-new-privileges \
-  -v "$PWD/project:/workspace" -w /workspace \
-  -v "$PWD/opencode.json:/opt/opencode.json:ro" \
-  -e OPENCODE_CONFIG=/opt/opencode.json \
-  -e ANTHROPIC_API_KEY \
-  -e GH_TOKEN \
-  -e GIT_AUTHOR_NAME="opencode-agent" -e GIT_AUTHOR_EMAIL="agent@localhost" \
-  -e GIT_COMMITTER_NAME="opencode-agent" -e GIT_COMMITTER_EMAIL="agent@localhost" \
-  -e GIT_CONFIG_COUNT=1 \
-  -e GIT_CONFIG_KEY_0=credential.helper \
-  -e GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
-  opencode-docker
+```
+./run.sh --project PATH [OPTIONS] [-- OPENCODE_ARGS...]
 
-Clean up afterwards:
+Required:
+  --project PATH       Project directory mounted as /workspace
 
-bash
+Options:
+  --gh-token TOKEN     GitHub fine-grained PAT (or $GH_TOKEN)
+  --anthropic-key KEY  Anthropic API key (or $ANTHROPIC_API_KEY)
+  --config PATH        Path to opencode.json config file
+  --keep               Keep dind running after agent exits (faster next run)
+  --build              Force rebuild of Docker image
+
+Pass-through:
+  -- ARGS              Arguments forwarded to opencode
+```
+
+### Examples
+
+```bash
+# Basic run
+./run.sh --project ~/myrepo
+
+# With explicit keys
+./run.sh --project ~/myrepo \
+  --anthropic-key sk-ant-... \
+  --gh-token github_pat_...
+
+# Custom opencode config
+cp opencode.json.example ~/myrepo/opencode.json
+# edit ~/myrepo/opencode.json
+./run.sh --project ~/myrepo --config ~/myrepo/opencode.json
+
+# Keep dind between runs (faster iteration)
+./run.sh --project ~/myrepo --keep
+# ... later, clean up manually:
 docker rm -f oc-dind && docker network rm oc-net
 
-Gotchas
+# Pass args to opencode
+./run.sh --project ~/myrepo -- --help
+```
 
-Bind mounts resolve on the daemon, not in the agent’s container. When the agent runs docker run -v /workspace/x:/x, the path is looked up inside oc-dind. That’s why the project is mounted into the sidecar at the same /workspace path.
-No TLS on the daemon. DOCKER_TLS_CERTDIR="" turns TLS off. That’s acceptable only because oc-net is a private network with just these two containers on it.
---privileged on the sidecar is a real escape risk if the agent does something hostile inside it. On a Linux host, run the sidecar with --runtime=sysbox-runc instead of --privileged to close that gap.
-On Docker Desktop (Mac/Windows), everything already runs inside a VM, which softens the privileged risk somewhat.
+## Git access setup
+
+Create a **fine-grained PAT** on GitHub scoped to exactly one repo:
+
+1. GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens
+2. Resource owner: your org or account
+3. Repository access: only the target repo
+4. Permissions: **Contents** → Read and Write
+5. Copy the token → pass as `GH_TOKEN`
+
+The agent uses a credential helper (`agent.env`) so git operations inside the container authenticate automatically. The token never touches the project files.
+
+## opencode.json
+
+Copy `opencode.json.example` to your project or pass it via `--config`:
+
+```json
+{
+  "model": "claude-sonnet-4-6",
+  "provider": "anthropic"
+}
+```
+
+If `--config` is omitted, opencode uses its built-in defaults.
+
+## Security notes
+
+| Concern | Mitigation |
+|---|---|
+| Agent escapes container | `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges` |
+| DinD privileged escape | `oc-net` private bridge; only agent can reach it |
+| TLS on DinD socket | Not needed — private network only |
+| Linux host privileged risk | Use `--runtime=sysbox-runc` on DinD instead of `--privileged` |
+| Mac/Windows Docker Desktop | VM boundary already isolates DinD from host |
+| Token scope | Fine-grained PAT limits push to one repo |
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `Dockerfile` | Extends opencode image with `git`, `docker-cli`, `docker-cli-buildx` |
+| `run.sh` | Parametrized launcher — sets up network, dind, and runs the agent |
+| `agent.env` | Git identity and credential helper env vars (no secrets) |
+| `opencode.json.example` | Sample opencode config to copy to your project |

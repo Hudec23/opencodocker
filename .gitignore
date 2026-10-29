@@ -1,0 +1,3 @@
+project/
+*.env.local
+.DS_Store
