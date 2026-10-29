@@ -12,6 +12,7 @@ PROJECT=""
 INSTANCE=""
 GH_TOKEN="${GH_TOKEN:-}"
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+VLLM_API_KEY="${VLLM_API_KEY:-}"
 OPENCODE_CONFIG=""
 KEEP=false
 BUILD=false
@@ -27,6 +28,7 @@ Options (project):
 Options:
   --gh-token TOKEN     GitHub fine-grained PAT with push access (or \$GH_TOKEN)
   --anthropic-key KEY  Anthropic API key (or \$ANTHROPIC_API_KEY)
+  --vllm-key KEY       vLLM API key (or \$VLLM_API_KEY)
   --config PATH        Path to opencode.json config file
   --instance NAME      Instance name suffix for network/dind (default: project basename)
                        Use this to run multiple agents simultaneously
@@ -68,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --instance)      INSTANCE="$2"; shift 2 ;;
         --gh-token)      GH_TOKEN="$2"; shift 2 ;;
         --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
+        --vllm-key)      VLLM_API_KEY="$2"; shift 2 ;;
         --config)        OPENCODE_CONFIG="$2"; shift 2 ;;
         --keep)          KEEP=true; shift ;;
         --build)         BUILD=true; shift ;;
@@ -77,9 +80,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$PROJECT" ]]           && PROJECT="$SCRIPT_DIR/project"
-[[ -z "$ANTHROPIC_API_KEY" ]] && die "ANTHROPIC_API_KEY not set (use --anthropic-key or env var)"
-[[ ! -d "$PROJECT" ]]         && die "project directory not found: $PROJECT"
+[[ -z "$PROJECT" ]] && PROJECT="$SCRIPT_DIR/project"
+[[ ! -d "$PROJECT" ]] && die "project directory not found: $PROJECT"
+[[ -z "$ANTHROPIC_API_KEY" && -z "$VLLM_API_KEY" ]] && die "no API key set — need ANTHROPIC_API_KEY or VLLM_API_KEY"
 
 PROJECT="$(cd "$PROJECT" && pwd)"
 
@@ -162,10 +165,11 @@ ARGS=(
     -v "$PROJECT:/workspace"
     -w /workspace
     --env-file "$SCRIPT_DIR/agent.env"
-    -e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
 )
 
-[[ -n "$GH_TOKEN" ]] && ARGS+=(-e "GH_TOKEN=$GH_TOKEN")
+[[ -n "$ANTHROPIC_API_KEY" ]] && ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+[[ -n "$VLLM_API_KEY" ]]      && ARGS+=(-e "VLLM_API_KEY=$VLLM_API_KEY")
+[[ -n "$GH_TOKEN" ]]          && ARGS+=(-e "GH_TOKEN=$GH_TOKEN")
 
 if [[ -n "$OPENCODE_CONFIG" ]]; then
     [[ ! -f "$OPENCODE_CONFIG" ]] && die "config file not found: $OPENCODE_CONFIG"

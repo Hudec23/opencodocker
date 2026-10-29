@@ -1,4 +1,91 @@
 {
-  "model": "claude-sonnet-4-6",
-  "provider": "anthropic"
+  "$schema": "https://opencode.ai/config.json",
+  "model": "vllm/local",
+  "small_model": "vllm/local",
+  "provider": {
+    "vllm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "vLLM",
+      "options": {
+        "baseURL": "http://192.168.1.50:8000/v1",
+        "apiKey": "{env:VLLM_API_KEY}"
+      },
+      "models": {
+        "local": {
+          "name": "Local: whatever profile is running",
+          "limit": {
+            "context": 65536,
+            "output": 16384
+          }
+        },
+        "qwen3.8-27b": {
+          "name": "Qwen3.8 27B (main coder, 64K)",
+          "limit": {
+            "context": 65536,
+            "output": 16384
+          }
+        },
+        "qwen3.8-27b-90k": {
+          "name": "Qwen3.8 27B (main coder, 90K)",
+          "limit": {
+            "context": 92160,
+            "output": 16384
+          }
+        },
+        "qwen3.6-35b-a3b": {
+          "name": "Qwen3.6 35B-A3B (fast coder)",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        },
+        "glm-4.7-flash": {
+          "name": "GLM-4.7 Flash (fast agent)",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        },
+        "gemma-4-31b": {
+          "name": "Gemma 4 31B (reasoning / architecture)",
+          "limit": {
+            "context": 65536,
+            "output": 16384
+          }
+        },
+        "gpt-oss-20b": {
+          "name": "gpt-oss 20B (light reasoner)",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        }
+      }
+    }
+  },
+  "agent": {
+    "build": {
+      "model": "vllm/local"
+    },
+    "plan": {
+      "model": "anthropic/claude-opus-5-5"
+    }
+  },
+  "permission": {
+    "edit": "allow",
+    "webfetch": "allow",
+    "bash": {
+      "*": "allow",
+      "git push*": "allow",
+      "git reset --hard*": "deny",
+      "rm -rf /*": "deny",
+      "sudo *": "deny"
+    }
+  },
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp"
+    }
+  }
 }
