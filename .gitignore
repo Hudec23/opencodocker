@@ -1,3 +1,4 @@
-project/
+project/*
+!project/.gitkeep
 *.env.local
 .DS_Store

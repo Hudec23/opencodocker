@@ -17,8 +17,8 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") --project PATH [OPTIONS] [-- OPENCODE_ARGS...]
 
-Required:
-  --project PATH       Project directory mounted as /workspace in the agent
+Options (project):
+  --project PATH       Project directory mounted as /workspace (default: ./project)
 
 Options:
   --gh-token TOKEN     GitHub fine-grained PAT with push access (or \$GH_TOKEN)
@@ -73,7 +73,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$PROJECT" ]]           && die "--project is required"
+[[ -z "$PROJECT" ]]           && PROJECT="$SCRIPT_DIR/project"
 [[ -z "$ANTHROPIC_API_KEY" ]] && die "ANTHROPIC_API_KEY not set (use --anthropic-key or env var)"
 [[ ! -d "$PROJECT" ]]         && die "project directory not found: $PROJECT"
 
