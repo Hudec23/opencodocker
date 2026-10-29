@@ -1,4 +1,5 @@
 project/*
 !project/.gitkeep
+.env
 *.env.local
 .DS_Store
