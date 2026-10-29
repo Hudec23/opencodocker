@@ -1,129 +1,180 @@
 # opencode-docker
 
-Containerized agentic coder using [opencode](https://github.com/anomalyco/opencode) with Docker-in-Docker (DinD). The agent receives a project directory, follows instructions in the repo, writes code from scratch, and can spin up Docker services to validate its work. Git push access is scoped to a single repo via a fine-grained token.
+Containerized agentic coder using [opencode](https://github.com/anomalyco/opencode) with Docker-in-Docker. The agent receives a project directory, follows instructions in the repo, writes code from scratch, and can spin up Docker services to validate its work. Git push access is scoped to a single repo via a fine-grained PAT.
 
 ## How it works
 
 ```
-┌─────────────────────────┐     tcp://oc-dind:2375
-│  opencode-docker (agent) │──────────────────────►┌──────────────┐
-│  --read-only             │                        │  oc-dind     │
-│  --cap-drop ALL          │                        │  (privileged)│
-│  /workspace (project)    │                        │  /workspace  │
-└─────────────────────────┘                        └──────────────┘
-         oc-net (private bridge)
+oc-net-NAME (--internal, no direct internet)
+┌──────────────────────────────────────────────────────┐
+│                                                      │
+│  agent          tcp://oc-dind-NAME:2375              │
+│  (hardened) ──────────────────────────► dind ────────┼──► internet
+│             │                           (privileged) │   (docker pull)
+│             │  http://oc-proxy-NAME:PORT             │
+│             └──────────────────────► socat proxy ────┼──► VLLM_ENDPOINT only
+│                                                      │
+└──────────────────────────────────────────────────────┘
+                                    oc-ext-NAME (internet-facing, proxy + dind only)
 ```
 
-The agent container is hardened (read-only FS, dropped caps, no new privileges). The DinD sidecar sits on the same private network — the agent talks to it via `DOCKER_HOST`. Both containers share the same `/workspace` mount so bind mounts inside agent-spawned containers resolve correctly.
+Agent runs on an `--internal` bridge — no direct internet access. The socat proxy is the only egress path for API calls, and it forwards to exactly one host:port (`VLLM_ENDPOINT`). DinD gets a second network interface for docker image pulls.
 
 ## Prerequisites
 
 - Docker (Desktop on Mac, Engine on Linux)
-- Anthropic API key
-- GitHub fine-grained PAT (for git push — see below)
+- Anthropic API key and/or vLLM endpoint
+- GitHub fine-grained PAT (for git push — see [Git access setup](#git-access-setup))
 
 ## Quick start
 
 ```bash
-# 1. Clone this repo
 git clone https://github.com/Hudec23/opencode-docker
 cd opencode-docker
 
-# 2. Build the image
-docker build -t opencode-docker .
+# configure keys once
+cp .env.example .env
+nano .env
 
-# 3. Run against your project
-export ANTHROPIC_API_KEY=sk-ant-...
-export GH_TOKEN=github_pat_...
+# drop your project here (or pass --project PATH)
+cp -r ~/mycode project/
 
-./run.sh --project /path/to/your/project
+# run
+./run.sh
 ```
+
+The script builds the image on first run, creates all containers and networks, waits for dind to be ready, then drops you into the agent. On exit it cleans everything up.
+
+## Configuration
+
+All keys live in `.env` (gitignored). Copy from the example and fill in:
+
+```bash
+# Anthropic — needed if opencode.json uses any anthropic/* model
+ANTHROPIC_API_KEY=sk-ant-...
+
+# vLLM — set both if using a local vLLM server
+VLLM_ENDPOINT=http://192.168.1.10:8000
+VLLM_API_KEY=your-key-or-any-string-if-no-auth
+
+# GitHub — needed for git push inside the agent
+GH_TOKEN=github_pat_...
+```
+
+At least one of `ANTHROPIC_API_KEY` or `VLLM_API_KEY` must be set.
 
 ## Usage
 
 ```
-./run.sh --project PATH [OPTIONS] [-- OPENCODE_ARGS...]
+./run.sh [OPTIONS] [-- OPENCODE_ARGS...]
 
-Required:
-  --project PATH       Project directory mounted as /workspace
-
-Options:
-  --gh-token TOKEN     GitHub fine-grained PAT (or $GH_TOKEN)
-  --anthropic-key KEY  Anthropic API key (or $ANTHROPIC_API_KEY)
+  --project PATH       Project directory → /workspace  (default: ./project)
+  --anthropic-key KEY  Anthropic API key               (or $ANTHROPIC_API_KEY)
+  --vllm-key KEY       vLLM API key                    (or $VLLM_API_KEY)
+  --vllm-endpoint URL  vLLM server address             (or $VLLM_ENDPOINT)
+  --gh-token TOKEN     GitHub fine-grained PAT         (or $GH_TOKEN)
   --config PATH        Path to opencode.json config file
-  --keep               Keep dind running after agent exits (faster next run)
-  --build              Force rebuild of Docker image
-
-Pass-through:
-  -- ARGS              Arguments forwarded to opencode
+  --instance NAME      Instance suffix — set this to run multiple agents
+                       simultaneously (default: project basename)
+  --keep               Keep containers after run (faster next start)
+  --build              Force rebuild of opencode-docker image
+  -- ARGS              Pass-through args forwarded to opencode
 ```
 
 ### Examples
 
 ```bash
-# Basic run
+# Default: uses ./project and .env
+./run.sh
+
+# Explicit project path
 ./run.sh --project ~/myrepo
 
-# With explicit keys
-./run.sh --project ~/myrepo \
-  --anthropic-key sk-ant-... \
-  --gh-token github_pat_...
-
 # Custom opencode config
-cp opencode.json.example ~/myrepo/opencode.json
-# edit ~/myrepo/opencode.json
 ./run.sh --project ~/myrepo --config ~/myrepo/opencode.json
 
-# Keep dind between runs (faster iteration)
-./run.sh --project ~/myrepo --keep
-# ... later, clean up manually:
-docker rm -f oc-dind && docker network rm oc-net
+# Keep containers between runs (skip dind startup wait)
+./run.sh --keep
+# clean up manually later:
+docker rm -f oc-dind-project oc-proxy-project && docker network rm oc-net-project oc-ext-project
 
-# Pass args to opencode
-./run.sh --project ~/myrepo -- --help
+# Two agents in parallel (separate terminals)
+./run.sh --project ~/repo1
+./run.sh --project ~/repo2
 ```
 
-## Git access setup
+## vLLM proxy
 
-Create a **fine-grained PAT** on GitHub scoped to exactly one repo:
+When `VLLM_ENDPOINT` is set, `run.sh` starts a socat proxy (`oc-proxy-NAME`) on the internal network that forwards TCP to your vLLM server. The agent never knows the real IP — it calls `http://oc-proxy-NAME:PORT` and the proxy forwards to `VLLM_ENDPOINT`.
 
-1. GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens
-2. Resource owner: your org or account
-3. Repository access: only the target repo
-4. Permissions: **Contents** → Read and Write
-5. Copy the token → pass as `GH_TOKEN`
+**Config in `.env`:**
+```bash
+VLLM_ENDPOINT=http://192.168.1.10:8000   # your real vLLM address
+VLLM_API_KEY=your-key
+```
 
-The agent uses a credential helper (`agent.env`) so git operations inside the container authenticate automatically. The token never touches the project files.
+**`opencode.json` picks it up automatically** via the `VLLM_BASE_URL` env var that `run.sh` injects:
+```json
+"options": {
+  "baseURL": "{env:VLLM_BASE_URL}/v1",
+  "apiKey": "{env:VLLM_API_KEY}"
+}
+```
+
+`run.sh` sets `VLLM_BASE_URL=http://oc-proxy-NAME:PORT` inside the container. Change the IP in `.env` — on next run the proxy restarts pointing to the new target; `opencode.json` needs no changes.
+
+**What the agent can and cannot reach:**
+
+| Destination | Agent | Proxy | dind |
+|---|---|---|---|
+| `VLLM_ENDPOINT` host:port | via proxy only | direct | no |
+| Internet (other) | blocked | blocked | yes (docker pull) |
+| dind socket | yes | no | — |
+| Host filesystem | no | no | no |
 
 ## opencode.json
 
-Copy `opencode.json.example` to your project or pass it via `--config`:
+Copy `opencode.json.example` and pass it via `--config`, or place it in the project dir. The example ships with a full vLLM provider config. Minimal Anthropic-only config:
 
 ```json
 {
-  "model": "claude-sonnet-4-6",
+  "model": "anthropic/claude-sonnet-4-6",
   "provider": "anthropic"
 }
 ```
 
-If `--config` is omitted, opencode uses its built-in defaults.
+See [opencode.ai/config](https://opencode.ai/config.json) for the full schema.
+
+## Git access setup
+
+Create a **fine-grained PAT** scoped to exactly one repo:
+
+1. GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens
+2. Repository access: **only the target repo**
+3. Permissions: **Contents** → Read and Write
+4. Set `GH_TOKEN` in `.env`
+
+The agent uses a credential helper (`agent.env`) — git push authenticates automatically. The token is passed as an env var and never written to the project files.
 
 ## Security notes
 
 | Concern | Mitigation |
 |---|---|
+| Agent calls arbitrary internet | `oc-net` is `--internal`; blocked at network level |
+| Agent calls non-vLLM hosts | socat proxy forwards to exactly one host:port |
 | Agent escapes container | `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges` |
-| DinD privileged escape | `oc-net` private bridge; only agent can reach it |
-| TLS on DinD socket | Not needed — private network only |
-| Linux host privileged risk | Use `--runtime=sysbox-runc` on DinD instead of `--privileged` |
-| Mac/Windows Docker Desktop | VM boundary already isolates DinD from host |
-| Token scope | Fine-grained PAT limits push to one repo |
+| DinD privileged escape | isolated to `oc-net`/`oc-ext`; agent has no shell on dind |
+| TLS on DinD socket | not needed — private bridge only |
+| Linux host privileged risk | use `--runtime=sysbox-runc` on dind instead of `--privileged` |
+| Token scope | fine-grained PAT limits push to one repo |
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Extends opencode image with `git`, `docker-cli`, `docker-cli-buildx` |
-| `run.sh` | Parametrized launcher — sets up network, dind, and runs the agent |
-| `agent.env` | Git identity and credential helper env vars (no secrets) |
-| `opencode.json.example` | Sample opencode config to copy to your project |
+| `Dockerfile` | Extends opencode with `git`, `docker-cli`, `docker-cli-buildx` |
+| `run.sh` | Launcher — builds image, manages networks/proxy/dind, runs agent |
+| `agent.env` | Git identity + credential helper (no secrets, safe to commit) |
+| `.env.example` | Key template — copy to `.env` and fill in |
+| `opencode.json.example` | Full vLLM provider config with permission rules |
+| `project/` | Default project directory (contents gitignored) |
