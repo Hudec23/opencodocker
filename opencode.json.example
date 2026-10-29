@@ -88,6 +88,11 @@
     "context7": {
       "type": "remote",
       "url": "https://mcp.context7.com/mcp"
+    },
+    "brave-search": {
+      "type": "remote",
+      "url": "https://mcp.brave.com/mcp",
+      "headers": { "Authorization": "Bearer {env:BRAVE_API_SEARCH_KEY}" }
     }
   }
 }

@@ -3,3 +3,4 @@ project/*
 .env
 *.env.local
 .DS_Store
+opencode.json
