@@ -5,18 +5,18 @@ Containerized agentic coder using [opencode](https://github.com/anomalyco/openco
 ## How it works
 
 ```
-oc-net-NAME (shared bridge — all containers + internet)
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  agent           tcp://oc-dind-NAME:2375                    │
-│  (hardened) ─────────────────────────────► dind ───────────►│ internet
-│             │                              (privileged)     │ (docker pull,
-│             │  http://oc-proxy-NAME:8080                    │  npm, apt...)
-│             └──────────────────────────► nginx proxy ──────►│ VLLM_ENDPOINT
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-  [--block-local] iptables rules on host, scoped to agent source IP
-  DROP 10/8, 172.16/12, 192.168/16 — ACCEPT ALLOWED_HOSTS first
+oc-net-NAME (shared bridge)
+┌──────────────────────────────────────────────┐
+│  agent (hardened)                            │
+│    │  tcp://oc-dind-NAME:2375                │
+│    ├─────────────────► dind (privileged) ────┼──► internet (docker pull, npm...)
+│    │                                         │
+│    │  http://oc-proxy-NAME:8080              │
+│    └─────────────────► nginx proxy ──────────┼──► VLLM_ENDPOINT
+│                                              │
+└──────────────────────────────────────────────┘
+[--block-local] iptables on host — scoped to agent source IP only
+  ACCEPT ALLOWED_HOSTS → DROP 10/8, 172.16/12, 192.168/16
 ```
 
 Agent is hardened (read-only FS, dropped caps). DinD gives the agent a Docker daemon isolated from the host. nginx proxy handles vLLM routing (Host header + SNI for tunnels). Optional iptables rules block LAN access from the agent at kernel level on Linux.
