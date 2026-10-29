@@ -46,10 +46,9 @@ Options (misc):
 Pass-through:
   -- ARGS              Arguments forwarded to opencode inside the container
 
-Network isolation:
-  oc-net-NAME   --internal bridge (agent, proxy, dind) — no direct internet
-  oc-ext-NAME   regular bridge (proxy + dind only) — internet access
-  oc-proxy-NAME nginx container forwarding only to VLLM_ENDPOINT
+Containers:
+  oc-net-NAME   shared bridge — agent, proxy, dind all have internet
+  oc-proxy-NAME nginx — routes vLLM calls through tunnel (Host/SNI handled)
   oc-dind-NAME  Docker-in-Docker for agent-spawned containers
 
 Examples:
@@ -93,8 +92,7 @@ PROJECT="$(cd "$PROJECT" && pwd)"
 [[ -z "$INSTANCE" ]] && INSTANCE="$(basename "$PROJECT")"
 INSTANCE="$(echo "$INSTANCE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')"
 
-NETWORK="oc-net-${INSTANCE}"      # --internal: agent cannot reach internet directly
-EXT_NETWORK="oc-ext-${INSTANCE}"  # regular: proxy + dind for image pulls
+NETWORK="oc-net-${INSTANCE}"
 DIND_NAME="oc-dind-${INSTANCE}"
 PROXY_NAME="oc-proxy-${INSTANCE}"
 PROXY_CONF="/tmp/oc-proxy-${INSTANCE}.conf"
@@ -151,20 +149,8 @@ if $BUILD || ! docker image inspect "$IMAGE" &>/dev/null; then
     docker build -t "$IMAGE" "$SCRIPT_DIR"
 fi
 
-# ── Networks ─────────────────────────────────────────────────────────────────
-if docker network inspect "$NETWORK" &>/dev/null; then
-    IS_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$NETWORK")"
-    if [[ "$IS_INTERNAL" != "true" ]]; then
-        echo "Recreating $NETWORK as --internal..."
-        docker network rm "$NETWORK"
-        docker network create --internal "$NETWORK"
-    fi
-else
-    docker network create --internal "$NETWORK"
-fi
-
-docker network inspect "$EXT_NETWORK" &>/dev/null || \
-    docker network create "$EXT_NETWORK"
+# ── Network ──────────────────────────────────────────────────────────────────
+docker network inspect "$NETWORK" &>/dev/null || docker network create "$NETWORK"
 
 # ── Proxy (nginx) ─────────────────────────────────────────────────────────────
 start_proxy() {
@@ -175,8 +161,8 @@ start_proxy() {
         --label "opencode.vllm_endpoint=$VLLM_ENDPOINT" \
         -v "$PROXY_CONF:/etc/nginx/nginx.conf:ro" \
         nginx:alpine
-    docker network connect "$EXT_NETWORK" "$PROXY_NAME"
 }
+
 
 if [[ -n "$VLLM_ENDPOINT" ]]; then
     if docker inspect "$PROXY_NAME" &>/dev/null; then
@@ -188,7 +174,6 @@ if [[ -n "$VLLM_ENDPOINT" ]]; then
         elif [[ "$(docker inspect -f '{{.State.Running}}' "$PROXY_NAME")" != "true" ]]; then
             write_proxy_conf
             docker start "$PROXY_NAME"
-            docker network connect "$EXT_NETWORK" "$PROXY_NAME" 2>/dev/null || true
         else
             echo "proxy already running → ${VLLM_ENDPOINT}"
         fi
@@ -206,7 +191,6 @@ if docker inspect "$DIND_NAME" &>/dev/null; then
     elif [[ "$(docker inspect -f '{{.State.Running}}' "$DIND_NAME")" != "true" ]]; then
         echo "Restarting stopped dind..."
         docker start "$DIND_NAME"
-        docker network connect "$EXT_NETWORK" "$DIND_NAME" 2>/dev/null || true
     else
         echo "dind already running"
     fi
@@ -221,7 +205,6 @@ if ! docker inspect "$DIND_NAME" &>/dev/null; then
         --label "opencode.project=$PROJECT" \
         -v "$PROJECT:/workspace" \
         docker:dind
-    docker network connect "$EXT_NETWORK" "$DIND_NAME"
 fi
 
 # Wait for dockerd inside dind
@@ -243,8 +226,7 @@ cleanup() {
     echo "Cleaning up..."
     docker rm -f "$DIND_NAME"  2>/dev/null || true
     docker rm -f "$PROXY_NAME" 2>/dev/null || true
-    docker network rm "$NETWORK"     2>/dev/null || true
-    docker network rm "$EXT_NETWORK" 2>/dev/null || true
+    docker network rm "$NETWORK" 2>/dev/null || true
     rm -f "$PROXY_CONF"
 }
 trap cleanup EXIT INT TERM
