@@ -7,7 +7,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "vLLM",
       "options": {
-        "baseURL": "http://192.168.1.50:8000/v1",
+        "baseURL": "{env:VLLM_BASE_URL}/v1",
         "apiKey": "{env:VLLM_API_KEY}"
       },
       "models": {
@@ -76,7 +76,9 @@
     "webfetch": "allow",
     "bash": {
       "*": "allow",
-      "git push*": "allow",
+      "git add*": "allow",
+      "git commit*": "allow",
+      "git push*": "deny",
       "git reset --hard*": "deny",
       "rm -rf /*": "deny",
       "sudo *": "deny"
