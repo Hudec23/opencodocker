@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$SCRIPT_DIR/.env" ]] && set -o allexport && source "$SCRIPT_DIR/.env" && set +o allexport
 
 IMAGE=opencode-docker
-PROXY_LISTEN_PORT=8080   # fixed port nginx listens on inside the container
+PROXY_LISTEN_PORT=8080
 
 PROJECT=""
 INSTANCE=""
@@ -15,6 +15,8 @@ GH_TOKEN="${GH_TOKEN:-}"
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 VLLM_API_KEY="${VLLM_API_KEY:-}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-}"
+BLOCK_LOCAL="${BLOCK_LOCAL:-false}"
+ALLOWED_HOSTS="${ALLOWED_HOSTS:-}"
 OPENCODE_CONFIG=""
 KEEP=false
 BUILD=false
@@ -31,9 +33,12 @@ Options (keys — all readable from .env):
   --anthropic-key KEY  Anthropic API key          (or \$ANTHROPIC_API_KEY)
   --vllm-key KEY       vLLM API key               (or \$VLLM_API_KEY)
   --vllm-endpoint URL  vLLM server URL to proxy   (or \$VLLM_ENDPOINT)
-                       Supports http:// and https:// (tunnels, ngrok, etc.)
-                       Agent is isolated; this is the only host it can reach.
   --gh-token TOKEN     GitHub fine-grained PAT     (or \$GH_TOKEN)
+
+Options (network):
+  --block-local        Block agent from reaching LAN/private IPs (Linux only,
+                       requires root). Set ALLOWED_HOSTS in .env for exceptions.
+                       (or set BLOCK_LOCAL=true in .env)
 
 Options (misc):
   --config PATH        Path to opencode.json config file
@@ -46,18 +51,10 @@ Options (misc):
 Pass-through:
   -- ARGS              Arguments forwarded to opencode inside the container
 
-Containers:
-  oc-net-NAME   shared bridge — agent, proxy, dind all have internet
-  oc-proxy-NAME nginx — routes vLLM calls through tunnel (Host/SNI handled)
-  oc-dind-NAME  Docker-in-Docker for agent-spawned containers
-
 Examples:
   $(basename "$0")
-  $(basename "$0") --project ~/myrepo
-  $(basename "$0") --project ~/myrepo --config ~/myrepo/opencode.json
-  # two agents in parallel (different terminals):
-  $(basename "$0") --project ~/repo1
-  $(basename "$0") --project ~/repo2
+  $(basename "$0") --project ~/myrepo --block-local
+  $(basename "$0") -- run --standalone --auto "Read task.md and implement it"
 EOF
     exit 0
 }
@@ -72,6 +69,7 @@ while [[ $# -gt 0 ]]; do
         --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
         --vllm-key)      VLLM_API_KEY="$2"; shift 2 ;;
         --vllm-endpoint) VLLM_ENDPOINT="$2"; shift 2 ;;
+        --block-local)   BLOCK_LOCAL=true; shift ;;
         --config)        OPENCODE_CONFIG="$2"; shift 2 ;;
         --keep)          KEEP=true; shift ;;
         --build)         BUILD=true; shift ;;
@@ -88,14 +86,15 @@ done
 
 PROJECT="$(cd "$PROJECT" && pwd)"
 
-# Derive instance name from project basename if not set
 [[ -z "$INSTANCE" ]] && INSTANCE="$(basename "$PROJECT")"
 INSTANCE="$(echo "$INSTANCE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')"
 
 NETWORK="oc-net-${INSTANCE}"
 DIND_NAME="oc-dind-${INSTANCE}"
 PROXY_NAME="oc-proxy-${INSTANCE}"
+AGENT_NAME="oc-agent-${INSTANCE}"
 PROXY_CONF="/tmp/oc-proxy-${INSTANCE}.conf"
+AGENT_IP_FILE="/tmp/oc-agent-ip-${INSTANCE}"
 
 # Parse VLLM_ENDPOINT → upstream host for nginx Host header + SNI
 VLLM_UPSTREAM_HOST=""
@@ -104,15 +103,61 @@ if [[ -n "$VLLM_ENDPOINT" ]]; then
     [[ "$VLLM_ENDPOINT" == https://* ]] && VLLM_IS_HTTPS=true
     _stripped="${VLLM_ENDPOINT#http://}"
     _stripped="${_stripped#https://}"
-    _stripped="${_stripped%%/*}"          # strip path
-    VLLM_UPSTREAM_HOST="${_stripped}"     # host:port or just host (used as Host header + SNI)
+    _stripped="${_stripped%%/*}"
+    VLLM_UPSTREAM_HOST="${_stripped}"
 fi
 
-# Generate nginx config for the proxy.
-# nginx receives plain HTTP from agent, proxies to VLLM_ENDPOINT (http or https).
-# For HTTPS upstreams (tunnels): proxy_ssl_server_name sends the correct SNI during
-# TLS handshake — without this, tunnel providers (ngrok, cloudflare) can't identify
-# the virtual host and return 403.
+# ── iptables (--block-local) ──────────────────────────────────────────────────
+# Rules are scoped to the agent container's source IP only.
+# nginx proxy and dind have different source IPs — unaffected.
+# ALLOWED_HOSTS (.env, comma-separated) are accepted before private ranges are dropped.
+
+if $BLOCK_LOCAL; then
+    if ! command -v iptables &>/dev/null; then
+        echo "warning: iptables not found — --block-local requires Linux. Skipping."
+        BLOCK_LOCAL=false
+    elif ! iptables -L DOCKER-USER &>/dev/null 2>&1; then
+        echo "warning: cannot access DOCKER-USER chain — run as root for --block-local. Skipping."
+        BLOCK_LOCAL=false
+    fi
+fi
+
+add_iptables_rules() {
+    local ip="$1"
+    echo "iptables: blocking LAN from agent ($ip)..."
+    # DROP private ranges first (they land below ACCEPT rules due to -I ordering)
+    for range in "169.254.0.0/16" "100.64.0.0/10" "192.168.0.0/16" "172.16.0.0/12" "10.0.0.0/8"; do
+        iptables -I DOCKER-USER -s "$ip" -d "$range" -j DROP
+    done
+    # ACCEPT allowlist — each -I goes to top, ending up above all DROPs
+    if [[ -n "$ALLOWED_HOSTS" ]]; then
+        IFS=',' read -ra _hosts <<< "$ALLOWED_HOSTS"
+        for host in "${_hosts[@]}"; do
+            host="${host// /}"
+            [[ -z "$host" ]] && continue
+            iptables -I DOCKER-USER -s "$ip" -d "$host" -j ACCEPT
+            echo "iptables: allowed $host for agent"
+        done
+    fi
+}
+
+remove_iptables_rules() {
+    local ip="$1"
+    echo "iptables: removing rules for agent ($ip)..."
+    if [[ -n "$ALLOWED_HOSTS" ]]; then
+        IFS=',' read -ra _hosts <<< "$ALLOWED_HOSTS"
+        for host in "${_hosts[@]}"; do
+            host="${host// /}"
+            [[ -z "$host" ]] && continue
+            iptables -D DOCKER-USER -s "$ip" -d "$host" -j ACCEPT 2>/dev/null || true
+        done
+    fi
+    for range in "169.254.0.0/16" "100.64.0.0/10" "192.168.0.0/16" "172.16.0.0/12" "10.0.0.0/8"; do
+        iptables -D DOCKER-USER -s "$ip" -d "$range" -j DROP 2>/dev/null || true
+    done
+}
+
+# ── nginx proxy config ────────────────────────────────────────────────────────
 write_proxy_conf() {
     local ssl_directives=""
     if $VLLM_IS_HTTPS; then
@@ -121,7 +166,6 @@ write_proxy_conf() {
             proxy_ssl_name        ${VLLM_UPSTREAM_HOST};
             proxy_ssl_verify      off;"
     fi
-
     cat > "$PROXY_CONF" <<NGINXEOF
 events {}
 http {
@@ -143,13 +187,13 @@ http {
 NGINXEOF
 }
 
-# Build agent image if missing or --build requested
+# ── Build image ───────────────────────────────────────────────────────────────
 if $BUILD || ! docker image inspect "$IMAGE" &>/dev/null; then
     echo "Building $IMAGE..."
     docker build -t "$IMAGE" "$SCRIPT_DIR"
 fi
 
-# ── Network ──────────────────────────────────────────────────────────────────
+# ── Network ───────────────────────────────────────────────────────────────────
 docker network inspect "$NETWORK" &>/dev/null || docker network create "$NETWORK"
 
 # ── Proxy (nginx) ─────────────────────────────────────────────────────────────
@@ -163,7 +207,6 @@ start_proxy() {
         nginx:alpine
 }
 
-
 if [[ -n "$VLLM_ENDPOINT" ]]; then
     if docker inspect "$PROXY_NAME" &>/dev/null; then
         PROXY_ENDPOINT="$(docker inspect -f '{{index .Config.Labels "opencode.vllm_endpoint"}}' "$PROXY_NAME" 2>/dev/null || true)"
@@ -172,8 +215,7 @@ if [[ -n "$VLLM_ENDPOINT" ]]; then
             docker rm -f "$PROXY_NAME"
             start_proxy
         elif [[ "$(docker inspect -f '{{.State.Running}}' "$PROXY_NAME")" != "true" ]]; then
-            write_proxy_conf
-            docker start "$PROXY_NAME"
+            write_proxy_conf && docker start "$PROXY_NAME"
         else
             echo "proxy already running → ${VLLM_ENDPOINT}"
         fi
@@ -207,7 +249,6 @@ if ! docker inspect "$DIND_NAME" &>/dev/null; then
         docker:dind
 fi
 
-# Wait for dockerd inside dind
 echo -n "Waiting for dind..."
 for _ in {1..60}; do
     docker exec "$DIND_NAME" docker info &>/dev/null && break
@@ -218,12 +259,19 @@ docker exec "$DIND_NAME" docker info &>/dev/null || die "dind failed to start wi
 echo " ready"
 
 # ── Cleanup trap ──────────────────────────────────────────────────────────────
+WATCHER_PID=""
 CLEANED=false
 cleanup() {
     [[ "$CLEANED" == true ]] && return
     CLEANED=true
+    [[ -n "$WATCHER_PID" ]] && kill "$WATCHER_PID" 2>/dev/null || true
+    if $BLOCK_LOCAL && [[ -f "$AGENT_IP_FILE" ]]; then
+        remove_iptables_rules "$(cat "$AGENT_IP_FILE")"
+        rm -f "$AGENT_IP_FILE"
+    fi
     $KEEP && return
     echo "Cleaning up..."
+    docker rm -f "$AGENT_NAME" 2>/dev/null || true
     docker rm -f "$DIND_NAME"  2>/dev/null || true
     docker rm -f "$PROXY_NAME" 2>/dev/null || true
     docker network rm "$NETWORK" 2>/dev/null || true
@@ -232,8 +280,32 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
+# Background watcher: once agent container starts, get its IP and add iptables rules.
+# Runs concurrently with docker run — rules are applied within ~100ms of start.
+if $BLOCK_LOCAL; then
+    (
+        i=0
+        while [[ $i -lt 100 ]]; do
+            ip=$(docker inspect -f \
+                "{{(index .NetworkSettings.Networks \"${NETWORK}\").IPAddress}}" \
+                "$AGENT_NAME" 2>/dev/null || true)
+            if [[ -n "$ip" ]]; then
+                echo "$ip" > "$AGENT_IP_FILE"
+                add_iptables_rules "$ip"
+                break
+            fi
+            sleep 0.1
+            ((i++)) || true
+        done
+    ) &
+    WATCHER_PID=$!
+fi
+
+docker rm -f "$AGENT_NAME" 2>/dev/null || true
+
 ARGS=(
     docker run --rm -it
+    --name "$AGENT_NAME"
     --network "$NETWORK"
     -e "DOCKER_HOST=tcp://${DIND_NAME}:2375"
     --read-only --tmpfs /tmp:rw,exec,size=1g
@@ -250,7 +322,6 @@ ARGS=(
 [[ -n "$VLLM_API_KEY" ]]      && ARGS+=(-e "VLLM_API_KEY=$VLLM_API_KEY")
 [[ -n "$GH_TOKEN" ]]          && ARGS+=(-e "GH_TOKEN=$GH_TOKEN")
 
-# Point agent at nginx proxy (plain HTTP) — proxy handles http→https and Host header
 if [[ -n "$VLLM_ENDPOINT" ]]; then
     ARGS+=(-e "VLLM_BASE_URL=http://${PROXY_NAME}:${PROXY_LISTEN_PORT}")
 fi
