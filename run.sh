@@ -2,11 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NETWORK=oc-net
-DIND_NAME=oc-dind
 IMAGE=opencode-docker
 
 PROJECT=""
+INSTANCE=""
 GH_TOKEN="${GH_TOKEN:-}"
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 OPENCODE_CONFIG=""
@@ -25,6 +24,8 @@ Options:
   --gh-token TOKEN     GitHub fine-grained PAT with push access (or \$GH_TOKEN)
   --anthropic-key KEY  Anthropic API key (or \$ANTHROPIC_API_KEY)
   --config PATH        Path to opencode.json config file
+  --instance NAME      Instance name suffix for network/dind (default: project basename)
+                       Use this to run multiple agents simultaneously
   --keep               Keep dind container after run (faster next start)
   --build              Force rebuild of Docker image
   -h, --help           Show this help
@@ -48,6 +49,9 @@ Examples:
   $(basename "$0") --project ~/myrepo
   $(basename "$0") --project ~/myrepo --config ~/myrepo/opencode.json
   GH_TOKEN=ghp_xxx $(basename "$0") --project ~/myrepo -- --help
+  # run two agents in parallel (different terminals):
+  $(basename "$0") --project ~/repo1
+  $(basename "$0") --project ~/repo2
 EOF
     exit 0
 }
@@ -57,6 +61,7 @@ die() { echo "error: $*" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do
     case $1 in
         --project)       PROJECT="$2"; shift 2 ;;
+        --instance)      INSTANCE="$2"; shift 2 ;;
         --gh-token)      GH_TOKEN="$2"; shift 2 ;;
         --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
         --config)        OPENCODE_CONFIG="$2"; shift 2 ;;
@@ -73,6 +78,14 @@ done
 [[ ! -d "$PROJECT" ]]         && die "project directory not found: $PROJECT"
 
 PROJECT="$(cd "$PROJECT" && pwd)"
+
+# Derive instance name from project basename if not set
+[[ -z "$INSTANCE" ]] && INSTANCE="$(basename "$PROJECT")"
+# Sanitize: lowercase, strip non-alphanumeric except dash
+INSTANCE="$(echo "$INSTANCE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')"
+
+NETWORK="oc-net-${INSTANCE}"
+DIND_NAME="oc-dind-${INSTANCE}"
 
 # Build image if missing or --build requested
 if $BUILD || ! docker image inspect "$IMAGE" &>/dev/null; then
