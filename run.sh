@@ -99,19 +99,31 @@ DIND_NAME="oc-dind-${INSTANCE}"
 PROXY_NAME="oc-proxy-${INSTANCE}"
 PROXY_CONF="/tmp/oc-proxy-${INSTANCE}.conf"
 
-# Parse VLLM_ENDPOINT → upstream host for nginx Host header
+# Parse VLLM_ENDPOINT → upstream host for nginx Host header + SNI
 VLLM_UPSTREAM_HOST=""
+VLLM_IS_HTTPS=false
 if [[ -n "$VLLM_ENDPOINT" ]]; then
+    [[ "$VLLM_ENDPOINT" == https://* ]] && VLLM_IS_HTTPS=true
     _stripped="${VLLM_ENDPOINT#http://}"
     _stripped="${_stripped#https://}"
     _stripped="${_stripped%%/*}"          # strip path
-    VLLM_UPSTREAM_HOST="${_stripped}"     # host:port or just host (used as Host header)
+    VLLM_UPSTREAM_HOST="${_stripped}"     # host:port or just host (used as Host header + SNI)
 fi
 
-# Generate nginx config for the proxy
-# nginx receives plain HTTP from agent, proxies to VLLM_ENDPOINT (http or https),
-# sets Host header to the real upstream hostname so tunnel routing works.
+# Generate nginx config for the proxy.
+# nginx receives plain HTTP from agent, proxies to VLLM_ENDPOINT (http or https).
+# For HTTPS upstreams (tunnels): proxy_ssl_server_name sends the correct SNI during
+# TLS handshake — without this, tunnel providers (ngrok, cloudflare) can't identify
+# the virtual host and return 403.
 write_proxy_conf() {
+    local ssl_directives=""
+    if $VLLM_IS_HTTPS; then
+        ssl_directives="
+            proxy_ssl_server_name on;
+            proxy_ssl_name        ${VLLM_UPSTREAM_HOST};
+            proxy_ssl_verify      off;"
+    fi
+
     cat > "$PROXY_CONF" <<NGINXEOF
 events {}
 http {
@@ -126,7 +138,7 @@ http {
             proxy_cache         off;
             proxy_read_timeout  600s;
             proxy_send_timeout  600s;
-            client_max_body_size 50m;
+            client_max_body_size 50m;${ssl_directives}
         }
     }
 }
