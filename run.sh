@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$SCRIPT_DIR/.env" ]] && set -o allexport && source "$SCRIPT_DIR/.env" && set +o allexport
 
 IMAGE=opencode-docker
+PROXY_LISTEN_PORT=8080   # fixed port nginx listens on inside the container
 
 PROJECT=""
 INSTANCE=""
@@ -29,10 +30,9 @@ Options (project):
 Options (keys — all readable from .env):
   --anthropic-key KEY  Anthropic API key          (or \$ANTHROPIC_API_KEY)
   --vllm-key KEY       vLLM API key               (or \$VLLM_API_KEY)
-  --vllm-endpoint URL  vLLM base URL to proxy to  (or \$VLLM_ENDPOINT)
-                       e.g. http://192.168.1.10:8000
-                       Agent is isolated from internet; this is the only
-                       external host it can reach.
+  --vllm-endpoint URL  vLLM server URL to proxy   (or \$VLLM_ENDPOINT)
+                       Supports http:// and https:// (tunnels, ngrok, etc.)
+                       Agent is isolated; this is the only host it can reach.
   --gh-token TOKEN     GitHub fine-grained PAT     (or \$GH_TOKEN)
 
 Options (misc):
@@ -49,7 +49,7 @@ Pass-through:
 Network isolation:
   oc-net-NAME   --internal bridge (agent, proxy, dind) — no direct internet
   oc-ext-NAME   regular bridge (proxy + dind only) — internet access
-  oc-proxy-NAME socat container forwarding only to VLLM_ENDPOINT
+  oc-proxy-NAME nginx container forwarding only to VLLM_ENDPOINT
   oc-dind-NAME  Docker-in-Docker for agent-spawned containers
 
 Examples:
@@ -97,18 +97,41 @@ NETWORK="oc-net-${INSTANCE}"      # --internal: agent cannot reach internet dire
 EXT_NETWORK="oc-ext-${INSTANCE}"  # regular: proxy + dind for image pulls
 DIND_NAME="oc-dind-${INSTANCE}"
 PROXY_NAME="oc-proxy-${INSTANCE}"
+PROXY_CONF="/tmp/oc-proxy-${INSTANCE}.conf"
 
-# Parse VLLM_ENDPOINT into host + port for socat
-VLLM_TARGET_HOST=""
-VLLM_TARGET_PORT=""
+# Parse VLLM_ENDPOINT → upstream host for nginx Host header
+VLLM_UPSTREAM_HOST=""
 if [[ -n "$VLLM_ENDPOINT" ]]; then
     _stripped="${VLLM_ENDPOINT#http://}"
     _stripped="${_stripped#https://}"
-    _stripped="${_stripped%%/*}"          # strip any path
-    VLLM_TARGET_HOST="${_stripped%%:*}"
-    VLLM_TARGET_PORT="${_stripped##*:}"
-    [[ "$VLLM_TARGET_PORT" == "$VLLM_TARGET_HOST" ]] && VLLM_TARGET_PORT=80
+    _stripped="${_stripped%%/*}"          # strip path
+    VLLM_UPSTREAM_HOST="${_stripped}"     # host:port or just host (used as Host header)
 fi
+
+# Generate nginx config for the proxy
+# nginx receives plain HTTP from agent, proxies to VLLM_ENDPOINT (http or https),
+# sets Host header to the real upstream hostname so tunnel routing works.
+write_proxy_conf() {
+    cat > "$PROXY_CONF" <<NGINXEOF
+events {}
+http {
+    server {
+        listen ${PROXY_LISTEN_PORT};
+        location / {
+            proxy_pass          ${VLLM_ENDPOINT};
+            proxy_set_header    Host ${VLLM_UPSTREAM_HOST};
+            proxy_http_version  1.1;
+            proxy_set_header    Connection "";
+            proxy_buffering     off;
+            proxy_cache         off;
+            proxy_read_timeout  600s;
+            proxy_send_timeout  600s;
+            client_max_body_size 50m;
+        }
+    }
+}
+NGINXEOF
+}
 
 # Build agent image if missing or --build requested
 if $BUILD || ! docker image inspect "$IMAGE" &>/dev/null; then
@@ -117,7 +140,6 @@ if $BUILD || ! docker image inspect "$IMAGE" &>/dev/null; then
 fi
 
 # ── Networks ─────────────────────────────────────────────────────────────────
-# oc-net: internal — recreate if it exists but isn't internal (legacy cleanup)
 if docker network inspect "$NETWORK" &>/dev/null; then
     IS_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$NETWORK")"
     if [[ "$IS_INTERNAL" != "true" ]]; then
@@ -129,19 +151,18 @@ else
     docker network create --internal "$NETWORK"
 fi
 
-# oc-ext: regular bridge for internet-facing containers
 docker network inspect "$EXT_NETWORK" &>/dev/null || \
     docker network create "$EXT_NETWORK"
 
-# ── Proxy (socat) ─────────────────────────────────────────────────────────────
+# ── Proxy (nginx) ─────────────────────────────────────────────────────────────
 start_proxy() {
-    echo "Starting proxy → ${VLLM_TARGET_HOST}:${VLLM_TARGET_PORT}..."
+    echo "Starting proxy → ${VLLM_ENDPOINT}..."
+    write_proxy_conf
     docker run -d --name "$PROXY_NAME" \
         --network "$NETWORK" \
         --label "opencode.vllm_endpoint=$VLLM_ENDPOINT" \
-        alpine/socat \
-        "TCP-LISTEN:${VLLM_TARGET_PORT},fork,reuseaddr" \
-        "TCP:${VLLM_TARGET_HOST}:${VLLM_TARGET_PORT}"
+        -v "$PROXY_CONF:/etc/nginx/nginx.conf:ro" \
+        nginx:alpine
     docker network connect "$EXT_NETWORK" "$PROXY_NAME"
 }
 
@@ -153,10 +174,11 @@ if [[ -n "$VLLM_ENDPOINT" ]]; then
             docker rm -f "$PROXY_NAME"
             start_proxy
         elif [[ "$(docker inspect -f '{{.State.Running}}' "$PROXY_NAME")" != "true" ]]; then
+            write_proxy_conf
             docker start "$PROXY_NAME"
             docker network connect "$EXT_NETWORK" "$PROXY_NAME" 2>/dev/null || true
         else
-            echo "proxy already running → ${VLLM_TARGET_HOST}:${VLLM_TARGET_PORT}"
+            echo "proxy already running → ${VLLM_ENDPOINT}"
         fi
     else
         start_proxy
@@ -211,6 +233,7 @@ cleanup() {
     docker rm -f "$PROXY_NAME" 2>/dev/null || true
     docker network rm "$NETWORK"     2>/dev/null || true
     docker network rm "$EXT_NETWORK" 2>/dev/null || true
+    rm -f "$PROXY_CONF"
 }
 trap cleanup EXIT INT TERM
 
@@ -233,9 +256,9 @@ ARGS=(
 [[ -n "$VLLM_API_KEY" ]]      && ARGS+=(-e "VLLM_API_KEY=$VLLM_API_KEY")
 [[ -n "$GH_TOKEN" ]]          && ARGS+=(-e "GH_TOKEN=$GH_TOKEN")
 
-# When proxy is active, point agent at it instead of the real endpoint
+# Point agent at nginx proxy (plain HTTP) — proxy handles http→https and Host header
 if [[ -n "$VLLM_ENDPOINT" ]]; then
-    ARGS+=(-e "VLLM_BASE_URL=http://${PROXY_NAME}:${VLLM_TARGET_PORT}")
+    ARGS+=(-e "VLLM_BASE_URL=http://${PROXY_NAME}:${PROXY_LISTEN_PORT}")
 fi
 
 if [[ -n "$OPENCODE_CONFIG" ]]; then

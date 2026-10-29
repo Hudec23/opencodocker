@@ -12,13 +12,13 @@ oc-net-NAME (--internal, no direct internet)
 │  (hardened) ──────────────────────────► dind ────────┼──► internet
 │             │                           (privileged) │   (docker pull)
 │             │  http://oc-proxy-NAME:PORT             │
-│             └──────────────────────► socat proxy ────┼──► VLLM_ENDPOINT only
+│             └──────────────────────► nginx proxy ────┼──► VLLM_ENDPOINT only
 │                                                      │
 └──────────────────────────────────────────────────────┘
                                     oc-ext-NAME (internet-facing, proxy + dind only)
 ```
 
-Agent runs on an `--internal` bridge — no direct internet access. The socat proxy is the only egress path for API calls, and it forwards to exactly one host:port (`VLLM_ENDPOINT`). DinD gets a second network interface for docker image pulls.
+Agent runs on an `--internal` bridge — no direct internet access. The nginx proxy is the only egress path for API calls, and it forwards to exactly one host:port (`VLLM_ENDPOINT`). DinD gets a second network interface for docker image pulls.
 
 ## Prerequisites
 
@@ -105,7 +105,7 @@ docker rm -f oc-dind-project oc-proxy-project && docker network rm oc-net-projec
 
 ## vLLM proxy
 
-When `VLLM_ENDPOINT` is set, `run.sh` starts a socat proxy (`oc-proxy-NAME`) on the internal network that forwards TCP to your vLLM server. The agent never knows the real IP — it calls `http://oc-proxy-NAME:PORT` and the proxy forwards to `VLLM_ENDPOINT`.
+When `VLLM_ENDPOINT` is set, `run.sh` starts an nginx proxy (`oc-proxy-NAME`) on the internal network that forwards TCP to your vLLM server. The agent never knows the real IP — it calls `http://oc-proxy-NAME:PORT` and the proxy forwards to `VLLM_ENDPOINT`.
 
 **Config in `.env`:**
 ```bash
@@ -161,7 +161,7 @@ The agent uses a credential helper (`agent.env`) — git push authenticates auto
 | Concern | Mitigation |
 |---|---|
 | Agent calls arbitrary internet | `oc-net` is `--internal`; blocked at network level |
-| Agent calls non-vLLM hosts | socat proxy forwards to exactly one host:port |
+| Agent calls non-vLLM hosts | nginx proxy forwards to exactly one host:port |
 | Agent escapes container | `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges` |
 | DinD privileged escape | isolated to `oc-net`/`oc-ext`; agent has no shell on dind |
 | TLS on DinD socket | not needed — private bridge only |
