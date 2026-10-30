@@ -88,6 +88,7 @@ PROJECT="$(cd "$PROJECT" && pwd)"
 
 [[ -z "$INSTANCE" ]] && INSTANCE="$(basename "$PROJECT")"
 INSTANCE="$(echo "$INSTANCE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')"
+[[ -z "$INSTANCE" ]] && die "instance name is empty after sanitizing — pass --instance NAME"
 
 NETWORK="oc-net-${INSTANCE}"
 DIND_NAME="oc-dind-${INSTANCE}"
@@ -95,6 +96,14 @@ PROXY_NAME="oc-proxy-${INSTANCE}"
 AGENT_NAME="oc-agent-${INSTANCE}"
 PROXY_CONF="/tmp/oc-proxy-${INSTANCE}.conf"
 AGENT_IP_FILE="/tmp/oc-agent-ip-${INSTANCE}"
+NET_SUBNET=""
+
+# Refuse to clobber another live run that maps to the same instance name
+# (e.g. ~/a/app and ~/b/app both default to "app").
+if [[ "$(docker inspect -f '{{.State.Running}}' "$AGENT_NAME" 2>/dev/null || true)" == "true" ]]; then
+    _other="$(docker inspect -f '{{index .Config.Labels "opencode.project"}}' "$DIND_NAME" 2>/dev/null || true)"
+    die "instance '$INSTANCE' already running${_other:+ for $_other} — pass --instance NAME"
+fi
 
 # Parse VLLM_ENDPOINT → upstream host for nginx Host header + SNI
 VLLM_UPSTREAM_HOST=""
@@ -108,27 +117,30 @@ if [[ -n "$VLLM_ENDPOINT" ]]; then
 fi
 
 # ── iptables (--block-local) ──────────────────────────────────────────────────
-# Rules are scoped to the agent container's source IP only.
-# nginx proxy and dind have different source IPs — unaffected.
+# Rules are scoped to the source IPs of the agent and dind. dind needs them too:
+# containers the agent launches inside dind are NATed to dind's IP on oc-net.
+# The nginx proxy is not restricted (it only forwards to VLLM_ENDPOINT).
 # ALLOWED_HOSTS (.env, comma-separated) are accepted before private ranges are dropped.
 
 if $BLOCK_LOCAL; then
     if ! command -v iptables &>/dev/null; then
         echo "warning: iptables not found — --block-local requires Linux. Skipping."
         BLOCK_LOCAL=false
-    elif ! iptables -L DOCKER-USER &>/dev/null 2>&1; then
+    elif ! iptables -L DOCKER-USER &>/dev/null; then
         echo "warning: cannot access DOCKER-USER chain — run as root for --block-local. Skipping."
         BLOCK_LOCAL=false
     fi
 fi
 
 add_iptables_rules() {
-    local ip="$1"
-    echo "iptables: blocking LAN from agent ($ip)..."
+    local ip="$1" label="$2"
+    echo "iptables: blocking LAN from $label ($ip)..."
     # DROP private ranges first (they land below ACCEPT rules due to -I ordering)
     for range in "169.254.0.0/16" "100.64.0.0/10" "192.168.0.0/16" "172.16.0.0/12" "10.0.0.0/8"; do
         iptables -I DOCKER-USER -s "$ip" -d "$range" -j DROP
     done
+    # ACCEPT own bridge subnet (agent, dind + proxy live there, and it falls inside 172.16/12)
+    [[ -n "$NET_SUBNET" ]] && iptables -I DOCKER-USER -s "$ip" -d "$NET_SUBNET" -j ACCEPT
     # ACCEPT allowlist — each -I goes to top, ending up above all DROPs
     if [[ -n "$ALLOWED_HOSTS" ]]; then
         IFS=',' read -ra _hosts <<< "$ALLOWED_HOSTS"
@@ -136,14 +148,14 @@ add_iptables_rules() {
             host="${host// /}"
             [[ -z "$host" ]] && continue
             iptables -I DOCKER-USER -s "$ip" -d "$host" -j ACCEPT
-            echo "iptables: allowed $host for agent"
+            echo "iptables: allowed $host for $label"
         done
     fi
 }
 
 remove_iptables_rules() {
-    local ip="$1"
-    echo "iptables: removing rules for agent ($ip)..."
+    local ip="$1" label="$2"
+    echo "iptables: removing rules for $label ($ip)..."
     if [[ -n "$ALLOWED_HOSTS" ]]; then
         IFS=',' read -ra _hosts <<< "$ALLOWED_HOSTS"
         for host in "${_hosts[@]}"; do
@@ -152,6 +164,7 @@ remove_iptables_rules() {
             iptables -D DOCKER-USER -s "$ip" -d "$host" -j ACCEPT 2>/dev/null || true
         done
     fi
+    [[ -n "$NET_SUBNET" ]] && { iptables -D DOCKER-USER -s "$ip" -d "$NET_SUBNET" -j ACCEPT 2>/dev/null || true; }
     for range in "169.254.0.0/16" "100.64.0.0/10" "192.168.0.0/16" "172.16.0.0/12" "10.0.0.0/8"; do
         iptables -D DOCKER-USER -s "$ip" -d "$range" -j DROP 2>/dev/null || true
     done
@@ -193,8 +206,34 @@ if $BUILD || ! docker image inspect "$IMAGE" &>/dev/null; then
     docker build -t "$IMAGE" "$SCRIPT_DIR"
 fi
 
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
+WATCHER_PID=""
+DIND_IP=""
+CLEANED=false
+cleanup() {
+    [[ "$CLEANED" == true ]] && return
+    CLEANED=true
+    [[ -n "$WATCHER_PID" ]] && kill "$WATCHER_PID" 2>/dev/null || true
+    if $BLOCK_LOCAL && [[ -f "$AGENT_IP_FILE" ]]; then
+        remove_iptables_rules "$(cat "$AGENT_IP_FILE")" agent
+        rm -f "$AGENT_IP_FILE"
+    fi
+    if $BLOCK_LOCAL && [[ -n "$DIND_IP" ]]; then
+        remove_iptables_rules "$DIND_IP" dind
+    fi
+    $KEEP && return
+    echo "Cleaning up..."
+    docker rm -f "$AGENT_NAME" 2>/dev/null || true
+    docker rm -f "$DIND_NAME"  2>/dev/null || true
+    docker rm -f "$PROXY_NAME" 2>/dev/null || true
+    docker network rm "$NETWORK" 2>/dev/null || true
+    rm -f "$PROXY_CONF"
+}
+trap cleanup EXIT INT TERM
+
 # ── Network ───────────────────────────────────────────────────────────────────
 docker network inspect "$NETWORK" &>/dev/null || docker network create "$NETWORK"
+NET_SUBNET="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$NETWORK")"
 
 # ── Proxy (nginx) ─────────────────────────────────────────────────────────────
 start_proxy() {
@@ -258,28 +297,20 @@ done
 docker exec "$DIND_NAME" docker info &>/dev/null || die "dind failed to start within 60s"
 echo " ready"
 
-# ── Cleanup trap ──────────────────────────────────────────────────────────────
-WATCHER_PID=""
-CLEANED=false
-cleanup() {
-    [[ "$CLEANED" == true ]] && return
-    CLEANED=true
-    [[ -n "$WATCHER_PID" ]] && kill "$WATCHER_PID" 2>/dev/null || true
-    if $BLOCK_LOCAL && [[ -f "$AGENT_IP_FILE" ]]; then
-        remove_iptables_rules "$(cat "$AGENT_IP_FILE")"
-        rm -f "$AGENT_IP_FILE"
-    fi
-    $KEEP && return
-    echo "Cleaning up..."
-    docker rm -f "$AGENT_NAME" 2>/dev/null || true
-    docker rm -f "$DIND_NAME"  2>/dev/null || true
-    docker rm -f "$PROXY_NAME" 2>/dev/null || true
-    docker network rm "$NETWORK" 2>/dev/null || true
-    rm -f "$PROXY_CONF"
-}
-trap cleanup EXIT INT TERM
+# Block LAN for dind before the agent exists, so nothing launched via dind can
+# reach it. Remove first in case a crashed previous run left rules behind.
+if $BLOCK_LOCAL; then
+    DIND_IP="$(docker inspect -f \
+        "{{(index .NetworkSettings.Networks \"${NETWORK}\").IPAddress}}" "$DIND_NAME")"
+    [[ -z "$DIND_IP" ]] && die "could not determine dind IP for --block-local"
+    remove_iptables_rules "$DIND_IP" dind >/dev/null
+    add_iptables_rules "$DIND_IP" dind
+fi
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
+docker rm -f "$AGENT_NAME" 2>/dev/null || true
+rm -f "$AGENT_IP_FILE"
+
 # Background watcher: once agent container starts, get its IP and add iptables rules.
 # Runs concurrently with docker run — rules are applied within ~100ms of start.
 if $BLOCK_LOCAL; then
@@ -291,17 +322,16 @@ if $BLOCK_LOCAL; then
                 "$AGENT_NAME" 2>/dev/null || true)
             if [[ -n "$ip" ]]; then
                 echo "$ip" > "$AGENT_IP_FILE"
-                add_iptables_rules "$ip"
+                add_iptables_rules "$ip" agent
                 break
             fi
             sleep 0.1
             ((i++)) || true
         done
+        [[ -f "$AGENT_IP_FILE" ]] || echo "warning: agent IP not found within 10s — LAN NOT blocked" >&2
     ) &
     WATCHER_PID=$!
 fi
-
-docker rm -f "$AGENT_NAME" 2>/dev/null || true
 
 ARGS=(
     docker run --rm -it
@@ -321,6 +351,7 @@ ARGS=(
 [[ -n "$ANTHROPIC_API_KEY" ]] && ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
 [[ -n "$VLLM_API_KEY" ]]      && ARGS+=(-e "VLLM_API_KEY=$VLLM_API_KEY")
 [[ -n "$GH_TOKEN" ]]          && ARGS+=(-e "GH_TOKEN=$GH_TOKEN")
+[[ -n "${BRAVE_API_SEARCH_KEY:-}" ]] && ARGS+=(-e "BRAVE_API_SEARCH_KEY=$BRAVE_API_SEARCH_KEY")
 
 if [[ -n "$VLLM_ENDPOINT" ]]; then
     ARGS+=(-e "VLLM_BASE_URL=http://${PROXY_NAME}:${PROXY_LISTEN_PORT}")

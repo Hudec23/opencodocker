@@ -15,7 +15,7 @@ oc-net-NAME (shared bridge)
 │    └─────────────────► nginx proxy ──────────┼──► VLLM_ENDPOINT
 │                                              │
 └──────────────────────────────────────────────┘
-[--block-local] iptables on host — scoped to agent source IP only
+[--block-local] iptables on host — scoped to agent + dind source IPs
   ACCEPT ALLOWED_HOSTS → DROP 10/8, 172.16/12, 192.168/16
 ```
 
@@ -31,8 +31,8 @@ Agent is hardened (read-only FS, dropped caps). DinD gives the agent a Docker da
 ## Quick start
 
 ```bash
-git clone https://github.com/Hudec23/opencode-docker
-cd opencode-docker
+git clone https://github.com/Hudec23/opencodocker
+cd opencodocker
 
 cp .env.example .env
 nano .env          # fill in keys
@@ -116,11 +116,12 @@ By default the agent has full internet access (needed for MCP servers, webfetch,
 
 ### How it works
 
-`run.sh` adds rules to Docker's `DOCKER-USER` chain scoped to the **agent container's source IP only**. The nginx proxy and dind have different source IPs — their traffic is unaffected, so vLLM (via proxy) and docker image pulls (via dind) continue to work.
+`run.sh` adds rules to Docker's `DOCKER-USER` chain scoped to the **agent and dind source IPs**. dind is included because containers the agent starts inside it are NATed to dind's IP — otherwise `docker run alpine wget 192.168.x.x` would bypass the block. Public internet stays open, so image pulls and npm/pip inside dind keep working. The nginx proxy is not restricted (it only forwards to `VLLM_ENDPOINT`).
 
-Rule order in `DOCKER-USER`:
+Rule order in `DOCKER-USER` (same set for agent IP and dind IP):
 ```
 ACCEPT  <source: agent IP>  <dest: ALLOWED_HOSTS>   ← checked first
+ACCEPT  <source: agent IP>  <dest: oc-net subnet>   ← reach dind + proxy
 DROP    <source: agent IP>  <dest: 10.0.0.0/8>
 DROP    <source: agent IP>  <dest: 172.16.0.0/12>
 DROP    <source: agent IP>  <dest: 192.168.0.0/16>
@@ -128,7 +129,7 @@ DROP    <source: agent IP>  <dest: 100.64.0.0/10>   ← CGNAT
 DROP    <source: agent IP>  <dest: 169.254.0.0/16>  ← link-local
 ```
 
-Rules are added ~100ms after container start and removed on exit. No persistent state.
+dind rules are added before the agent starts; agent rules ~100ms after its container starts. All removed on exit.
 
 ### Setup
 
