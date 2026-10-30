@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Blocks commits that would leak private info into this public repo.
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass (only if you're sure):  git commit --no-verify
+set -euo pipefail
+
+fail=0
+err() { echo "pre-commit: $*" >&2; fail=1; }
+
+# ── Author / committer email must be a GitHub noreply address ─────────────────
+for ident in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+    email="$(git var "$ident" | sed -E 's/.*<([^>]*)>.*/\1/')"
+    [[ "$email" == *@users.noreply.github.com ]] || \
+        err "$ident email is '$email' — run: git config user.email <id>+<user>@users.noreply.github.com"
+done
+
+# ── Never commit real config files ────────────────────────────────────────────
+while IFS= read -r f; do
+    case "$(basename "$f")" in
+        .env|*.env.local|opencode.json) err "refusing to commit $f (holds real keys/endpoints)" ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=AM)
+
+# ── Scan added lines ──────────────────────────────────────────────────────────
+added="$(git diff --cached -U0 --no-color --diff-filter=AM -- . ':!.githooks/pre-commit' | grep -E '^\+[^+]' | sed 's/^+//' || true)"
+
+# API keys / tokens / private keys
+keys="$(grep -oE 'sk-ant-[A-Za-z0-9_-]{10,}|github_pat_[A-Za-z0-9_]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' <<< "$added" || true)"
+[[ -n "$keys" ]] && err "possible secret(s):"$'\n'"$keys"
+
+# Email addresses (noreply addresses are fine)
+emails="$(grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' <<< "$added" \
+    | grep -vE '@users\.noreply\.github\.com$|^noreply@anthropic\.com$|@localhost$' || true)"
+[[ -n "$emails" ]] && err "email address(es):"$'\n'"$emails"
+
+# Private IPs — only range bases and documented placeholder examples allowed
+ALLOWED_IPS='^(10\.0\.0\.0|172\.16\.0\.0|192\.168\.0\.0|100\.64\.0\.0|169\.254\.0\.0|10\.0\.0\.5|10\.0\.1\.100|192\.168\.1\.10|192\.168\.1\.50|192\.168\.1\.51)$'
+ips="$(grep -oE '(10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+|169\.254\.[0-9]+\.[0-9]+)' <<< "$added" \
+    | grep -vE "$ALLOWED_IPS" | sort -u || true)"
+[[ -n "$ips" ]] && err "private IP(s) — use a placeholder like 192.168.1.50 instead:"$'\n'"$ips"
+
+if (( fail )); then
+    echo "pre-commit: commit blocked. Fix the above, or bypass with --no-verify if it's a false positive." >&2
+    exit 1
+fi

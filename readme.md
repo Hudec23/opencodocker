@@ -223,3 +223,4 @@ The agent uses a credential helper (`agent.env`) — git push authenticates auto
 | `.env.example` | Config template — copy to `.env` |
 | `opencode.json.example` | Full vLLM provider config with permission rules |
 | `project/` | Default project directory (contents gitignored) |
+| `.githooks/pre-commit` | Blocks commits containing keys, emails, private IPs or real `.env`/`opencode.json`. Enable: `git config core.hooksPath .githooks` |
